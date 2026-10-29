@@ -1,28 +1,30 @@
 
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_MODEL = "openai/gpt-oss-20b";
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GROQ_TIMEOUT_MS = 2500;
+const MAX_HISTORY = 8;
+const GROQ_TIMEOUT_MS = 4500;
+const SERPER_TIMEOUT_MS = 700;
 
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Ты — голосовой помощник Яндекс Алисы.",
+  "Отвечай на языке пользователя, обычно по-русски.",
+  "Будь дружелюбным, точным и кратким.",
+  "Обычно отвечай в 1–3 предложениях, удобных для прослушивания.",
+  "Не используй Markdown, таблицы и декоративные символы.",
+  "Не выдумывай факты. Если информации недостаточно, скажи об этом."
 ].join(" ");
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, history = [], endSession = false) {
   return {
     version: "1.0",
     response: {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: {
+      history: cleanHistory(history)
+    }
   };
 }
 
@@ -32,68 +34,95 @@ function fitAliceText(value) {
     .replace(/\s{2,}/g, " ")
     .trim();
 
-  if (text.length <= MAX_ALICE_TEXT) {
-    return text || "Не удалось подготовить ответ.";
-  }
+  if (!text) return "Не удалось подготовить ответ.";
+  if (text.length <= MAX_ALICE_TEXT) return text;
 
-  const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
-  const sentenceEnd = Math.max(
-    candidate.lastIndexOf(". "),
-    candidate.lastIndexOf("! "),
-    candidate.lastIndexOf("? ")
+  const shortText = text.slice(0, MAX_ALICE_TEXT - 1);
+  const punctuation = Math.max(
+    shortText.lastIndexOf(". "),
+    shortText.lastIndexOf("! "),
+    shortText.lastIndexOf("? ")
   );
 
-  if (sentenceEnd >= 300) {
-    return candidate.slice(0, sentenceEnd + 1).trim();
+  if (punctuation >= 300) {
+    return shortText.slice(0, punctuation + 1);
   }
 
-  const lastSpace = candidate.lastIndexOf(" ");
-  return (
-    lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate
-  ).trim() + "…";
+  const space = shortText.lastIndexOf(" ");
+  return (space > 200 ? shortText.slice(0, space) : shortText) + "…";
 }
 
-function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
-}
-
-function safeHistory(history) {
+function cleanHistory(history) {
   if (!Array.isArray(history)) return [];
 
   return history
     .filter(
       item =>
         item &&
-        (item.role === "user" || item.role === "model") &&
+        (item.role === "user" || item.role === "assistant") &&
         typeof item.text === "string"
     )
-    .slice(-MAX_HISTORY_MESSAGES)
+    .slice(-MAX_HISTORY)
     .map(item => ({
       role: item.role,
-      text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
+      text: item.text.slice(0, 1000)
     }));
+}
+
+function isSearchIntent(text) {
+  return /сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|latest|today|current|news|weather|price|search/i.test(text);
+}
+
+function remainingTime(startedAt) {
+  return Math.max(100, 9500 - (Date.now() - startedAt));
 }
 
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    Math.max(100, timeoutMs)
-  );
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, {
-  ...options,
-  headers: Object.fromEntries(
-    Object.entries(options.headers || {}).map(([key, value]) => [
-      key,
-      String(value)
-    ])
-  ),
-  signal: controller.signal
-});
+    const headers = new Headers();
 
-    const data = await response.json().catch(() => ({}));
+    for (const [name, value] of Object.entries(options.headers || {})) {
+      const stringValue = String(value);
+
+      // Проверяем HTTP-заголовки до fetch, чтобы точно найти
+      // кириллицу или другой недопустимый символ.
+      for (let i = 0; i < stringValue.length; i++) {
+        const code = stringValue.charCodeAt(i);
+
+        if (code > 255 || code === 10 || code === 13) {
+          console.error(
+            "Invalid HTTP header value:",
+            name,
+            "character index:",
+            i,
+            "character code:",
+            code
+          );
+          throw new Error("INVALID_HTTP_HEADER_" + name);
+        }
+      }
+
+      headers.set(name, stringValue);
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      headers,
+      signal: controller.signal
+    });
+
+    const raw = await response.text();
+    let data = {};
+
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = { message: raw.slice(0, 500) };
+    }
+
     return { response, data };
   } finally {
     clearTimeout(timer);
@@ -102,7 +131,7 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 200) return "";
 
   try {
     const { response, data } = await fetchJson(
@@ -120,51 +149,34 @@ async function searchWeb(query, timeoutMs) {
           num: 3
         })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      timeoutMs
     );
 
     if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
+      console.error("Serper HTTP status:", response.status);
       return "";
     }
 
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
+    const results = Array.isArray(data.organic) ? data.organic : [];
 
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-
-    if (answerBox) {
-      items.unshift(
-        `Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`
-      );
-    }
-
-    return items.length ? items.join("\n") : "";
+    return results.slice(0, 3).map((item, index) =>
+      `${index + 1}. ${String(item.title || "").slice(0, 150)}. ` +
+      `${String(item.snippet || "").slice(0, 300)}`
+    ).join("\n");
   } catch (error) {
-    console.warn("Serper request failed; continuing without search.");
+    console.error("Serper error:", error.message);
     return "";
   }
 }
 
-async function askGroq(text, history, searchContext, timeoutMs) {
+async function askGroq(question, history, searchContext, timeoutMs) {
   const key = process.env.GROQ_API_KEY;
 
-  if (!key) throw new Error("MISSING_GROQ_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(
-    process.env.GROQ_MODEL || DEFAULT_MODEL
-  ).trim();
-
-  if (!/^[A-Za-z0-9._/-]+$/.test(model)) {
-    throw new Error("INVALID_MODEL_NAME");
+  if (!key || !key.trim()) {
+    throw new Error("MISSING_GROQ_KEY");
   }
+
+  const model = (process.env.GROQ_MODEL || DEFAULT_MODEL).trim();
 
   const messages = [
     {
@@ -173,92 +185,117 @@ async function askGroq(text, history, searchContext, timeoutMs) {
     }
   ];
 
-  for (const item of safeHistory(history)) {
+  for (const item of cleanHistory(history)) {
     messages.push({
-      role: item.role === "model" ? "assistant" : "user",
+      role: item.role,
       content: item.text
     });
   }
 
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
+  let userMessage = question;
+
+  if (searchContext) {
+    userMessage +=
+      "\n\nРезультаты поиска в интернете:\n" +
+      searchContext +
+      "\nИспользуй эти результаты, если они относятся к вопросу.";
+  }
 
   messages.push({
     role: "user",
-    content: prompt
+    content: userMessage
   });
 
-  const { response, data } = await fetchJson(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`
+  let result;
+
+  try {
+    result = await fetchJson(
+      GROQ_URL,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${key.trim()}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_completion_tokens: 300,
+          stream: false
+        })
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.5,
-        max_completion_tokens: 240,
-        stream: false
-      })
-    },
-    Math.min(GROQ_TIMEOUT_MS, timeoutMs)
-  );
+      timeoutMs
+    );
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("GROQ_TIMEOUT");
+    }
+    throw error;
+  }
+
+  const { response, data } = result;
 
   if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Groq request failed with HTTP", status);
+    // Не записываем ключи и полный запрос в логи.
+    console.error(
+      "Groq HTTP error:",
+      response.status,
+      String(data?.error?.code || data?.error?.type || "unknown")
+    );
 
-    if (status === 401 || status === 403) {
-      throw new Error("GROQ_KEY_REJECTED");
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("GROQ_AUTH_ERROR");
     }
 
-    if (status === 429) {
+    if (response.status === 429) {
       throw new Error("GROQ_RATE_LIMIT");
     }
 
-    if (status === 400 || status === 404) {
-      throw new Error("GROQ_MODEL_ERROR");
+    if (response.status === 400 || response.status === 404) {
+      throw new Error("GROQ_MODEL_OR_REQUEST_ERROR");
     }
 
-    throw new Error("GROQ_REQUEST_FAILED");
+    throw new Error("GROQ_SERVER_ERROR");
   }
 
   const answer = data?.choices?.[0]?.message?.content;
 
   if (typeof answer !== "string" || !answer.trim()) {
+    console.error("Groq returned an empty answer.");
     throw new Error("GROQ_EMPTY_RESPONSE");
   }
 
   return answer.trim();
 }
 
-function errorForUser(error) {
+function userError(error) {
   switch (error?.message) {
     case "MISSING_GROQ_KEY":
-      return "Сервер пока не настроен. Добавьте переменную GROQ_API_KEY в настройках Vercel.";
+      return "Сервер не настроен. Проверьте переменную GROQ_API_KEY в Vercel.";
 
-    case "GROQ_KEY_REJECTED":
-      return "Не удалось подключиться к Groq. Проверьте API-ключ в настройках Vercel.";
+    case "GROQ_AUTH_ERROR":
+      return "Groq не принял API-ключ. Проверьте ключ в настройках Vercel.";
 
     case "GROQ_RATE_LIMIT":
-      return "Сейчас превышен лимит запросов Groq. Попробуйте немного позже.";
+      return "Groq временно ограничил количество запросов. Попробуйте позже.";
 
-    case "GROQ_MODEL_ERROR":
-      return "Не удалось использовать выбранную модель Groq. Проверьте название модели.";
+    case "GROQ_MODEL_OR_REQUEST_ERROR":
+      return "Groq отклонил запрос или название модели. Проверьте настройки модели.";
+
+    case "GROQ_TIMEOUT":
+      return "Groq не успел ответить. Попробуйте ещё раз.";
 
     case "GROQ_EMPTY_RESPONSE":
-      return "Нейросеть не вернула ответ. Попробуйте задать вопрос ещё раз.";
+      return "Нейросеть вернула пустой ответ. Попробуйте ещё раз.";
 
-    case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
-      return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+    case "INVALID_HTTP_HEADER_Authorization":
+      return "Проверьте API-ключ Groq: в нём обнаружены недопустимые символы.";
+
+    case "INVALID_HTTP_HEADER_X-API-KEY":
+      return "Проверьте ключ Serper в настройках Vercel.";
 
     default:
-      return "Не получилось получить ответ от Groq. Попробуйте ещё раз чуть позже.";
+      return "Не удалось получить ответ от Groq. Попробуйте ещё раз чуть позже.";
   }
 }
 
@@ -267,39 +304,34 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       service: "alice-groq-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      message: "Webhook is ready."
     });
   }
 
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({
-      error: "Method not allowed"
-    });
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   const startedAt = Date.now();
-  const remainingMs = () =>
-    TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+  const body = req.body && typeof req.body === "object" ? req.body : {};
 
-  const body = req.body && typeof req.body === "object"
-    ? req.body
-    : {};
-
-  const text = String(
-    body?.request?.command ||
-    body?.request?.original_utterance ||
-    ""
+  const request = body.request || {};
+  const question = String(
+    request.command || request.original_utterance || ""
   ).trim();
 
-  const oldHistory = safeHistory(body?.state?.session?.history);
+  const history = cleanHistory(
+    body.state?.session?.history ||
+    body.state?.user?.history ||
+    []
+  );
 
-  if (!text) {
+  if (!question) {
     return res.status(200).json(
       aliceResponse(
-        "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
-        false,
-        oldHistory
+        "Привет! Задай мне вопрос, и я постараюсь помочь.",
+        history
       )
     );
   }
@@ -307,61 +339,37 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
 
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (process.env.SERPER_API_KEY && isSearchIntent(question)) {
       searchContext = await searchWeb(
-        text,
-        Math.min(
-          SERPER_TIMEOUT_MS,
-          Math.max(0, remainingMs() - 2600)
-        )
+        question,
+        Math.min(SERPER_TIMEOUT_MS, remainingTime(startedAt) - 5000)
       );
     }
 
     const answer = await askGroq(
-      text,
-      oldHistory,
+      question,
+      history,
       searchContext,
-      Math.max(
-        0,
-        Math.min(GROQ_TIMEOUT_MS, remainingMs() - 600)
-      )
+      Math.min(GROQ_TIMEOUT_MS, remainingTime(startedAt) - 500)
     );
 
-    const history = [
-      ...oldHistory,
-      {
-        role: "user",
-        text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
-      },
-      {
-        role: "model",
-        text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS)
-      }
-    ].slice(-MAX_HISTORY_MESSAGES);
+    const updatedHistory = cleanHistory([
+      ...history,
+      { role: "user", text: question },
+      { role: "assistant", text: answer }
+    ]);
 
     return res.status(200).json(
-      aliceResponse(answer, false, history)
+      aliceResponse(answer, updatedHistory)
     );
   } catch (error) {
-    const safeError =
-      error?.message === "AbortError"
-        ? new Error("TIME_BUDGET_EXHAUSTED")
-        : error;
+    const message = String(error?.message || "UNKNOWN_ERROR");
 
-    console.warn(
-      "Alice webhook returned a fallback response:",
-      safeError?.message || "unknown error"
-    );
+    // Не выводим секреты, содержимое запросов или ключи в логи.
+    console.error("Alice webhook error code:", message);
 
     return res.status(200).json(
-      aliceResponse(errorForUser(safeError), false, oldHistory)
+      aliceResponse(userError(error), history)
     );
   }
 }
-
-export {
-  aliceResponse,
-  fitAliceText,
-  isSearchIntent,
-  safeHistory
-};
