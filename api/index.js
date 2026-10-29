@@ -83,9 +83,15 @@ async function fetchJson(url, options, timeoutMs) {
 
   try {
     const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
+  ...options,
+  headers: Object.fromEntries(
+    Object.entries(options.headers || {}).map(([key, value]) => [
+      key,
+      String(value)
+    ])
+  ),
+  signal: controller.signal
+});
 
     const data = await response.json().catch(() => ({}));
     return { response, data };
