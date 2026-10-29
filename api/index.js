@@ -1,10 +1,11 @@
-const DEFAULT_MODEL = "gpt-4o-mini";
+
+const DEFAULT_MODEL = "deepseek-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const OPENAI_TIMEOUT_MS = 2500;
+const DEEPSEEK_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -60,11 +61,10 @@ function safeHistory(history) {
   if (!Array.isArray(history)) return [];
 
   return history
-    .filter(
-      item =>
-        item &&
-        (item.role === "user" || item.role === "model") &&
-        typeof item.text === "string"
+    .filter(item =>
+      item &&
+      (item.role === "user" || item.role === "model") &&
+      typeof item.text === "string"
     )
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({
@@ -85,7 +85,6 @@ async function fetchJson(url, options, timeoutMs) {
       ...options,
       signal: controller.signal
     });
-
     const data = await response.json().catch(() => ({}));
     return { response, data };
   } finally {
@@ -127,12 +126,10 @@ async function searchWeb(query, timeoutMs) {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
         const link = String(item.link || "").slice(0, 240);
-
         return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
       });
 
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-
     if (answerBox) {
       items.unshift(
         `Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`
@@ -146,14 +143,13 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askOpenAI(text, history, searchContext, timeoutMs) {
-  const key = process.env.OPENAI_API_KEY;
-
-  if (!key) throw new Error("MISSING_OPENAI_KEY");
+async function askDeepSeek(text, history, searchContext, timeoutMs) {
+  const key = process.env.DEEPSEEK_API_KEY;
+  if (!key) throw new Error("MISSING_DEEPSEEK_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(
-    process.env.OPENAI_MODEL || DEFAULT_MODEL
+    process.env.DEEPSEEK_MODEL || DEFAULT_MODEL
   ).trim();
 
   if (!/^[A-Za-z0-9._-]+$/.test(model)) {
@@ -178,7 +174,7 @@ async function askOpenAI(text, history, searchContext, timeoutMs) {
   messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    "https://api.openai.com/v1/chat/completions",
+    "https://api.deepseek.com/chat/completions",
     {
       method: "POST",
       headers: {
@@ -188,32 +184,30 @@ async function askOpenAI(text, history, searchContext, timeoutMs) {
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.5,
-        max_tokens: 240
+        stream: false,
+        max_tokens: 240,
+        thinking: { type: "disabled" }
       })
     },
-    Math.min(OPENAI_TIMEOUT_MS, timeoutMs)
+    Math.min(DEEPSEEK_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("OpenAI request failed with HTTP", status);
+    console.error("DeepSeek request failed with HTTP", status);
 
     if (status === 401 || status === 403) {
-      throw new Error("OPENAI_KEY_REJECTED");
+      throw new Error("DEEPSEEK_KEY_REJECTED");
     }
-
-    if (status === 429) {
-      throw new Error("OPENAI_QUOTA");
+    if (status === 402 || status === 429) {
+      throw new Error("DEEPSEEK_QUOTA");
     }
-
-    throw new Error("OPENAI_REQUEST_FAILED");
+    throw new Error("DEEPSEEK_REQUEST_FAILED");
   }
 
   const answer = data?.choices?.[0]?.message?.content;
-
   if (typeof answer !== "string" || !answer.trim()) {
-    throw new Error("OPENAI_EMPTY_RESPONSE");
+    throw new Error("DEEPSEEK_EMPTY_RESPONSE");
   }
 
   return answer.trim();
@@ -221,22 +215,17 @@ async function askOpenAI(text, history, searchContext, timeoutMs) {
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_OPENAI_KEY":
-      return "Сервер пока не настроен. Добавьте переменную OPENAI_API_KEY в настройках Vercel.";
-
-    case "OPENAI_KEY_REJECTED":
-      return "Не удалось подключиться к OpenAI. Проверьте API-ключ в настройках Vercel.";
-
-    case "OPENAI_QUOTA":
-      return "Не удалось получить ответ. Проверьте баланс и лимиты API OpenAI.";
-
-    case "OPENAI_EMPTY_RESPONSE":
+    case "MISSING_DEEPSEEK_KEY":
+      return "Сервер пока не настроен. Добавьте переменную DEEPSEEK_API_KEY в настройках Vercel.";
+    case "DEEPSEEK_KEY_REJECTED":
+      return "Не удалось подключиться к DeepSeek. Проверьте API-ключ в настройках Vercel.";
+    case "DEEPSEEK_QUOTA":
+      return "Не удалось получить ответ. Проверьте баланс и лимиты DeepSeek API.";
+    case "DEEPSEEK_EMPTY_RESPONSE":
       return "Не получилось подготовить ответ. Попробуйте задать вопрос иначе.";
-
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
-
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
   }
@@ -246,25 +235,21 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-openai-serper",
+      service: "alice-deepseek-serper",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
 
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({
-      error: "Method not allowed"
-    });
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   const startedAt = Date.now();
   const remainingMs = () =>
     TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
 
-  const body =
-    req.body && typeof req.body === "object" ? req.body : {};
-
+  const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(
     body?.request?.command ||
     body?.request?.original_utterance ||
@@ -296,36 +281,27 @@ export default async function handler(req, res) {
       );
     }
 
-    const answer = await askOpenAI(
+    const answer = await askDeepSeek(
       text,
       oldHistory,
       searchContext,
       Math.max(
         0,
-        Math.min(OPENAI_TIMEOUT_MS, remainingMs() - 600)
+        Math.min(DEEPSEEK_TIMEOUT_MS, remainingMs() - 600)
       )
     );
 
     const history = [
       ...oldHistory,
-      {
-        role: "user",
-        text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
-      },
-      {
-        role: "model",
-        text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS)
-      }
+      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    return res.status(200).json(
-      aliceResponse(answer, false, history)
-    );
+    return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError =
-      error?.message === "AbortError"
-        ? new Error("TIME_BUDGET_EXHAUSTED")
-        : error;
+    const safeError = error?.message === "AbortError"
+      ? new Error("TIME_BUDGET_EXHAUSTED")
+      : error;
 
     console.warn(
       "Alice webhook returned a fallback response:",
